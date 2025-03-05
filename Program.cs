@@ -2,6 +2,7 @@
 using System.Diagnostics;
 using System.Net.NetworkInformation;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Xml;
 
 namespace IpMonitor;
@@ -15,29 +16,56 @@ internal class Program
 
     public static async Task Main()
     {
-        Console.WriteLine("Enter your input in format: testTimeInSeconds IP1 IP2 ...");
-        var pars = Console.ReadLine();
-        var splitPars = pars.Split(" ");
-        int.TryParse(splitPars[0], out var testDuration);
-        var ipAddresses = splitPars.Skip(1).ToList();
+        var (testDuration, ipAddresses) = GetValidatedInput();
 
         File.Delete(xmlFilePath);
         Console.WriteLine($"Starting test for {testDuration} seconds on IPs: {string.Join(", ", ipAddresses)}");
 
         var writerTask = Task.Run(WriteResultsAsync);
 
-        var tasks = new List<Task>();
-        foreach (var ip in ipAddresses)
-            tasks.Add(PingMonitorAsync(ip, testDuration));
+        var tasks = ipAddresses
+            .Select(ip => PingMonitorAsync(ip, testDuration))
+            .ToList();
         await Task.WhenAll(tasks);
 
         isPingMonitoringComplete = true;
 
         await writerTask;
 
+        Console.WriteLine("Starting to process data from XML");
+
         await ReadResultsAsync();
     }
 
+    private static (int, List<string>) GetValidatedInput()
+    {
+        Console.WriteLine("Enter your input in format: testTimeInSeconds IP1 IP2 ...");
+        const string ipPattern = @"\b((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)(\.|$)){4}\b";
+        int testDuration;
+        List<string> ipAddresses;
+
+        while (true)
+        {
+            var pars = Console.ReadLine();
+            var splitPars = pars?.Split(" ") ?? Array.Empty<string>();
+
+            if (splitPars.Length < 2 ||
+                !int.TryParse(splitPars[0], out testDuration) ||
+                splitPars.Skip(1).Any(ip => !Regex.IsMatch(ip, ipPattern)))
+            {
+                Console.WriteLine("Wrong input format, Please enter your input in format: testTimeInSeconds IP1 IP2 ...");
+                continue;
+            }
+
+            ipAddresses = splitPars.Skip(1).ToList();
+            break;
+        }
+        return (testDuration, ipAddresses);
+    }
+
+    //------------------------------------------------------------------------------------------------------------------------------------------------------------
+    //The smallest possible timeout is currently around 500ms even if you set less, possible fix will be in future https://github.com/dotnet/runtime/issues/102445
+    //------------------------------------------------------------------------------------------------------------------------------------------------------------
     private static async Task PingMonitorAsync(string ip, int duration)
     {
         using Ping ping = new();
@@ -49,8 +77,11 @@ internal class Program
             var response = await ping.SendPingAsync(ip, 300);
             var stopTime = Stopwatch.GetTimestamp();
             var elapsedTime = (stopTime - startTime) * 1000.0 / Stopwatch.Frequency;
+
             pingResultsQueue.Enqueue((ip, DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss.fff"), response.Status == IPStatus.Success));
-            await Task.Delay(100);
+
+            var remainingTime = Math.Max(0, 100 - elapsedTime);
+            await Task.Delay((int)remainingTime);
         }
     }
 
