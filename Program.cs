@@ -4,37 +4,51 @@ using System.Net.NetworkInformation;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Xml;
+using Microsoft.Extensions.Logging;
 
 namespace IpMonitor;
 
 internal class Program
 {
     private const string xmlFilePath = "IpsAvailabilityResults.xml";
+    private static readonly ILogger<Program> logger = LoggerFactory
+        .Create(builder =>
+        {
+            builder.AddConsole();
+            builder.AddProvider(new FileLoggerProvider($"log-{DateTime.Now:yyyy-MM-dd_HH-mm-ss}.txt"));
+        })
+        .CreateLogger<Program>();
 
     private static readonly ConcurrentQueue<(string ip, string time, bool success)> pingResultsQueue = new();
     private static bool isPingMonitoringComplete;
+    private static DateTimeOffset dateStartTest;
+    private static DateTimeOffset dateEndTest;
 
     public static async Task Main()
     {
         var (testDuration, ipAddresses) = GetValidatedInput();
 
         File.Delete(xmlFilePath);
-        Console.WriteLine($"Starting test for {testDuration} seconds on IPs: {string.Join(", ", ipAddresses)}");
+        logger.LogInformation("Starting test for {testDuration} seconds on IPs: {ips)}", testDuration, string.Join(", ", ipAddresses));
 
         var writerTask = Task.Run(WriteResultsAsync);
 
+        dateStartTest = DateTimeOffset.UtcNow;
         var tasks = ipAddresses
             .Select(ip => PingMonitorAsync(ip, testDuration))
             .ToList();
         await Task.WhenAll(tasks);
-
+        dateEndTest = DateTimeOffset.UtcNow;
         isPingMonitoringComplete = true;
 
         await writerTask;
 
-        Console.WriteLine("Starting to process data from XML");
+        logger.LogInformation("Starting to process data from XML");
 
         await ReadResultsAsync();
+
+        Console.WriteLine("Press any key to exit...");
+        Console.ReadKey();
     }
 
     private static (int, List<string>) GetValidatedInput()
@@ -73,68 +87,91 @@ internal class Program
 
         while (stopwatch.Elapsed.TotalSeconds < duration)
         {
-            var startTime = Stopwatch.GetTimestamp();
-            var response = await ping.SendPingAsync(ip, 300);
-            var stopTime = Stopwatch.GetTimestamp();
-            var elapsedTime = (stopTime - startTime) * 1000.0 / Stopwatch.Frequency;
+            try
+            {
+                var startTime = Stopwatch.GetTimestamp();
+                var response = await ping.SendPingAsync(ip, 300);
+                var stopTime = Stopwatch.GetTimestamp();
+                var elapsedTime = (stopTime - startTime) * 1000.0 / Stopwatch.Frequency;
 
-            pingResultsQueue.Enqueue((ip, DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss.fff"), response.Status == IPStatus.Success));
+                pingResultsQueue.Enqueue((ip, DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss.fff"), response.Status == IPStatus.Success));
 
-            var remainingTime = Math.Max(0, 100 - elapsedTime);
-            await Task.Delay((int)remainingTime);
+                var remainingTime = Math.Max(0, 100 - elapsedTime);
+                await Task.Delay((int)remainingTime);
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "Error in ping monitoring for {ip}", ip);
+            }
         }
     }
 
     private static async Task WriteResultsAsync()
     {
-        await using var writer = XmlWriter.Create(xmlFilePath, new XmlWriterSettings { Indent = true, Async = true, Encoding = Encoding.UTF8 });
-        await writer.WriteStartDocumentAsync();
-        await writer.WriteStartElementAsync(null, "PingResults", null);
-
-        while (!isPingMonitoringComplete || !pingResultsQueue.IsEmpty)
+        try
         {
-            while (pingResultsQueue.TryDequeue(out var result))
-            {
-                await writer.WriteStartElementAsync(null, "PingResult", null);
-                await writer.WriteAttributeStringAsync(null, "IP", null, result.ip);
-                await writer.WriteAttributeStringAsync(null, "Time", null, result.time);
-                await writer.WriteAttributeStringAsync(null, "Success", null, result.success.ToString());
-                await writer.WriteEndElementAsync();
-            }
-            await Task.Delay(100);
-        }
+            await using var writer = XmlWriter.Create(xmlFilePath, new XmlWriterSettings { Indent = true, Async = true, Encoding = Encoding.UTF8 });
+            await writer.WriteStartDocumentAsync();
+            await writer.WriteStartElementAsync(null, "PingResults", null);
 
-        await writer.WriteEndElementAsync();
-        await writer.WriteEndDocumentAsync();
+            while (!isPingMonitoringComplete || !pingResultsQueue.IsEmpty)
+            {
+                while (pingResultsQueue.TryDequeue(out var result))
+                {
+                    await writer.WriteStartElementAsync(null, "PingResult", null);
+                    await writer.WriteAttributeStringAsync(null, "IP", null, result.ip);
+                    await writer.WriteAttributeStringAsync(null, "Time", null, result.time);
+                    await writer.WriteAttributeStringAsync(null, "Success", null, result.success.ToString());
+                    await writer.WriteEndElementAsync();
+                }
+                await Task.Delay(100);
+            }
+
+            await writer.WriteEndElementAsync();
+            await writer.WriteEndDocumentAsync();
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "Error while writing results to xml");
+        }
     }
 
     private static async Task ReadResultsAsync()
     {
         var results = new Dictionary<string, (int total, int success)>();
-
-        using var reader = XmlReader.Create(xmlFilePath, new XmlReaderSettings { Async = true });
-        while (await reader.ReadAsync())
+        try
         {
-            if (reader.NodeType == XmlNodeType.Element && reader.Name == "PingResult")
+            using var reader = XmlReader.Create(xmlFilePath, new XmlReaderSettings { Async = true });
+            while (await reader.ReadAsync())
             {
-                var ip = reader.GetAttribute("IP");
-                var success = bool.Parse(reader.GetAttribute("Success") ?? "false");
+                if (reader.NodeType == XmlNodeType.Element && reader.Name == "PingResult")
+                {
+                    var ip = reader.GetAttribute("IP");
+                    var success = bool.Parse(reader.GetAttribute("Success") ?? "false");
 
-                if (string.IsNullOrEmpty(ip))
-                    continue;
+                    if (string.IsNullOrEmpty(ip))
+                        continue;
 
-                if (!results.ContainsKey(ip))
-                    results[ip] = (0, 0);
-                results[ip] = (results[ip].total + 1, results[ip].success + (success ? 1 : 0));
+                    if (!results.ContainsKey(ip))
+                        results[ip] = (0, 0);
+                    results[ip] = (results[ip].total + 1, results[ip].success + (success ? 1 : 0));
+                }
             }
+        }
+        catch (Exception ex) 
+        {
+            logger.LogError(ex, "Error while reading results from xml");
         }
 
         Console.WriteLine("------------RESULTS-------------");
 
+        logger.LogInformation("Test run from {dateStartTest} to {dateEndTest}", dateStartTest.ToLocalTime(), dateEndTest.ToLocalTime());
+
         foreach (var (ip, (total, success)) in results)
         {
-            var availability = (success / (double)total) * 100;
-            Console.WriteLine($"{ip} - {availability:F2}% availability");
+            var availability = success / (double)total * 100;
+            var resultText = $"{ip} - {availability:F2}% availability - total ping tries: {total} ({success} successfull)";
+            logger.LogInformation(resultText);
         }
     }
 }
